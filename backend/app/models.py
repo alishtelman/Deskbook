@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+from datetime import date, time
+from typing import Optional
+
+from sqlalchemy import (
+    CheckConstraint,
+    Date,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    Time,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(120), unique=True, nullable=False, index=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(Text, nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, server_default="user")
+    created_at: Mapped[date] = mapped_column(
+        Date, nullable=False, server_default=func.current_date()
+    )
+
+    __table_args__ = (
+        CheckConstraint("role IN ('admin', 'user')", name="ck_users_role"),
+    )
+
+
+class Office(Base):
+    __tablename__ = "offices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    address: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+
+    floors: Mapped[list[Floor]] = relationship(
+        "Floor", back_populates="office", cascade="all, delete-orphan"
+    )
+    policies: Mapped[list[Policy]] = relationship(
+        "Policy", back_populates="office", cascade="all, delete-orphan"
+    )
+
+
+class Floor(Base):
+    __tablename__ = "floors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    office_id: Mapped[int] = mapped_column(
+        ForeignKey("offices.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    plan_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    office: Mapped[Office] = relationship("Office", back_populates="floors")
+    desks: Mapped[list[Desk]] = relationship(
+        "Desk", back_populates="floor", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("idx_floors_office_id", "office_id"),)
+
+
+class Desk(Base):
+    __tablename__ = "desks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    floor_id: Mapped[int] = mapped_column(
+        ForeignKey("floors.id", ondelete="CASCADE"), nullable=False
+    )
+    label: Mapped[str] = mapped_column(String(40), nullable=False)
+    type: Mapped[str] = mapped_column(String(10), nullable=False, server_default="flex")
+    assigned_to: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    zone: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    position_x: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    position_y: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    floor: Mapped[Floor] = relationship("Floor", back_populates="desks")
+    reservations: Mapped[list[Reservation]] = relationship(
+        "Reservation", back_populates="desk", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint("type IN ('flex', 'fixed')", name="ck_desks_type"),
+        Index("idx_desks_floor_id", "floor_id"),
+    )
+
+
+class Reservation(Base):
+    __tablename__ = "reservations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    desk_id: Mapped[int] = mapped_column(
+        ForeignKey("desks.id", ondelete="CASCADE"), nullable=False
+    )
+    # user_id stores the username string — intentionally NOT a FK to users.id
+    # because the frontend passes display names, not DB integer IDs.
+    user_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    reservation_date: Mapped[date] = mapped_column(Date, nullable=False)
+    start_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    end_time: Mapped[Optional[time]] = mapped_column(Time, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="active")
+    created_at: Mapped[date] = mapped_column(
+        Date, nullable=False, server_default=func.current_date()
+    )
+
+    desk: Mapped[Desk] = relationship("Desk", back_populates="reservations")
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'cancelled')", name="ck_reservations_status"),
+        Index("idx_reservations_desk_date", "desk_id", "reservation_date"),
+        Index("idx_reservations_user_id", "user_id"),
+    )
+
+
+class Policy(Base):
+    __tablename__ = "policies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    office_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("offices.id", ondelete="CASCADE"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    min_days_ahead: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_days_ahead: Mapped[int] = mapped_column(Integer, nullable=False, server_default="30")
+    min_duration_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    max_duration_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    no_show_timeout_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="15"
+    )
+
+    office: Mapped[Optional[Office]] = relationship("Office", back_populates="policies")
+
+    __table_args__ = (
+        CheckConstraint(
+            "min_days_ahead >= 0 AND max_days_ahead >= 0",
+            name="ck_policies_days_positive",
+        ),
+        CheckConstraint(
+            "min_days_ahead <= max_days_ahead",
+            name="ck_policies_days_order",
+        ),
+        Index("idx_policies_office_id", "office_id"),
+    )

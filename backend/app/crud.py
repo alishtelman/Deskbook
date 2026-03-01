@@ -1,0 +1,355 @@
+from __future__ import annotations
+
+from datetime import date, time
+from typing import Optional
+
+from sqlalchemy import and_
+from sqlalchemy.orm import Session
+
+from . import models, schemas
+
+
+def _time_overlaps(start_a: time, end_a: time, start_b: time, end_b: time) -> bool:
+    return start_a < end_b and start_b < end_a
+
+
+# ---------------------------------------------------------------------------
+# Offices
+# ---------------------------------------------------------------------------
+
+def list_offices(db: Session) -> list[models.Office]:
+    return db.query(models.Office).all()
+
+
+def create_office(db: Session, payload: schemas.OfficeCreate) -> models.Office:
+    office = models.Office(**payload.model_dump())
+    db.add(office)
+    db.commit()
+    db.refresh(office)
+    return office
+
+
+def update_office(db: Session, office_id: int, payload: schemas.OfficeUpdate) -> models.Office:
+    office = db.query(models.Office).filter(models.Office.id == office_id).first()
+    if office is None:
+        raise KeyError("office")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(office, key, value)
+    db.commit()
+    db.refresh(office)
+    return office
+
+
+def delete_office(db: Session, office_id: int) -> None:
+    office = db.query(models.Office).filter(models.Office.id == office_id).first()
+    if office is None:
+        raise KeyError("office")
+    db.delete(office)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Floors
+# ---------------------------------------------------------------------------
+
+def list_floors(db: Session, office_id: Optional[int] = None) -> list[models.Floor]:
+    q = db.query(models.Floor)
+    if office_id is not None:
+        q = q.filter(models.Floor.office_id == office_id)
+    return q.all()
+
+
+def create_floor(db: Session, payload: schemas.FloorCreate) -> models.Floor:
+    office = db.query(models.Office).filter(models.Office.id == payload.office_id).first()
+    if office is None:
+        raise KeyError("office")
+    floor = models.Floor(**payload.model_dump())
+    db.add(floor)
+    db.commit()
+    db.refresh(floor)
+    return floor
+
+
+def update_floor(db: Session, floor_id: int, payload: schemas.FloorUpdate) -> models.Floor:
+    floor = db.query(models.Floor).filter(models.Floor.id == floor_id).first()
+    if floor is None:
+        raise KeyError("floor")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(floor, key, value)
+    db.commit()
+    db.refresh(floor)
+    return floor
+
+
+def delete_floor(db: Session, floor_id: int) -> None:
+    floor = db.query(models.Floor).filter(models.Floor.id == floor_id).first()
+    if floor is None:
+        raise KeyError("floor")
+    db.delete(floor)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Desks
+# ---------------------------------------------------------------------------
+
+def list_desks(db: Session, floor_id: Optional[int] = None) -> list[models.Desk]:
+    q = db.query(models.Desk)
+    if floor_id is not None:
+        q = q.filter(models.Desk.floor_id == floor_id)
+    return q.all()
+
+
+def create_desk(db: Session, payload: schemas.DeskCreate) -> models.Desk:
+    floor = db.query(models.Floor).filter(models.Floor.id == payload.floor_id).first()
+    if floor is None:
+        raise KeyError("floor")
+    data = payload.model_dump()
+    if data.get("type") == "fixed" and not data.get("assigned_to"):
+        raise ValueError("Fixed desks must have an assigned employee.")
+    if data.get("type") == "flex":
+        data["assigned_to"] = None
+    desk = models.Desk(**data)
+    db.add(desk)
+    db.commit()
+    db.refresh(desk)
+    return desk
+
+
+def update_desk(db: Session, desk_id: int, payload: schemas.DeskUpdate) -> models.Desk:
+    desk = db.query(models.Desk).filter(models.Desk.id == desk_id).first()
+    if desk is None:
+        raise KeyError("desk")
+    update_data = payload.model_dump(exclude_unset=True)
+    next_type = update_data.get("type", desk.type)
+    next_assigned = update_data.get("assigned_to", desk.assigned_to)
+    if next_type == "fixed" and not next_assigned:
+        raise ValueError("Fixed desks must have an assigned employee.")
+    if next_type == "flex":
+        update_data["assigned_to"] = None
+    for key, value in update_data.items():
+        setattr(desk, key, value)
+    db.commit()
+    db.refresh(desk)
+    return desk
+
+
+def delete_desk(db: Session, desk_id: int) -> None:
+    desk = db.query(models.Desk).filter(models.Desk.id == desk_id).first()
+    if desk is None:
+        raise KeyError("desk")
+    db.delete(desk)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Availability
+# ---------------------------------------------------------------------------
+
+def check_availability(
+    db: Session,
+    desk_id: int,
+    reservation_date: date,
+    start_time: time,
+    end_time: time,
+    user_id: Optional[str] = None,
+) -> schemas.AvailabilityResponse:
+    desk = db.query(models.Desk).filter(models.Desk.id == desk_id).first()
+    if desk is None:
+        raise KeyError("desk")
+    if desk.type == "fixed" and not desk.assigned_to:
+        return schemas.AvailabilityResponse(
+            available=False, reason="Desk is fixed but has no assigned employee."
+        )
+    if desk.type == "fixed" and desk.assigned_to and desk.assigned_to != user_id:
+        return schemas.AvailabilityResponse(
+            available=False, reason="Desk is assigned to another employee."
+        )
+    active = (
+        db.query(models.Reservation)
+        .filter(
+            models.Reservation.desk_id == desk_id,
+            models.Reservation.reservation_date == reservation_date,
+            models.Reservation.status == "active",
+        )
+        .all()
+    )
+    for res in active:
+        if res.start_time and res.end_time:
+            if _time_overlaps(start_time, end_time, res.start_time, res.end_time):
+                return schemas.AvailabilityResponse(
+                    available=False,
+                    reason="Desk already reserved for the requested time.",
+                )
+    return schemas.AvailabilityResponse(available=True)
+
+
+# ---------------------------------------------------------------------------
+# Reservations
+# ---------------------------------------------------------------------------
+
+def list_reservations(
+    db: Session,
+    desk_id: Optional[int] = None,
+    reservation_date: Optional[date] = None,
+) -> list[models.Reservation]:
+    q = db.query(models.Reservation)
+    if desk_id is not None:
+        q = q.filter(models.Reservation.desk_id == desk_id)
+    if reservation_date is not None:
+        q = q.filter(models.Reservation.reservation_date == reservation_date)
+    return q.all()
+
+
+def create_reservation(db: Session, payload: schemas.ReservationCreate) -> models.Reservation:
+    """Create a reservation with SELECT FOR UPDATE to prevent double-booking."""
+    # Lock the desk row first to serialize concurrent bookings for same desk
+    desk = (
+        db.query(models.Desk)
+        .filter(models.Desk.id == payload.desk_id)
+        .with_for_update()
+        .first()
+    )
+    if desk is None:
+        raise KeyError("desk")
+
+    if desk.type == "fixed" and not desk.assigned_to:
+        raise ValueError("Desk is fixed but has no assigned employee.")
+    if desk.type == "fixed" and desk.assigned_to and desk.assigned_to != payload.user_id:
+        raise ValueError("Desk is assigned to another employee.")
+
+    # Lock active reservations for this desk/date to check overlaps atomically
+    active = (
+        db.query(models.Reservation)
+        .filter(
+            models.Reservation.desk_id == payload.desk_id,
+            models.Reservation.reservation_date == payload.reservation_date,
+            models.Reservation.status == "active",
+        )
+        .with_for_update()
+        .all()
+    )
+
+    for res in active:
+        if res.start_time and res.end_time and payload.start_time and payload.end_time:
+            if _time_overlaps(
+                payload.start_time, payload.end_time, res.start_time, res.end_time
+            ):
+                raise ValueError("Desk already reserved for the requested time.")
+
+    reservation = models.Reservation(
+        desk_id=payload.desk_id,
+        user_id=payload.user_id,
+        reservation_date=payload.reservation_date,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        status="active",
+    )
+    db.add(reservation)
+    db.commit()
+    db.refresh(reservation)
+    return reservation
+
+
+def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
+    reservation = (
+        db.query(models.Reservation)
+        .filter(models.Reservation.id == reservation_id)
+        .first()
+    )
+    if reservation is None:
+        raise KeyError("reservation")
+    reservation.status = "cancelled"
+    db.commit()
+    db.refresh(reservation)
+    return reservation
+
+
+# ---------------------------------------------------------------------------
+# Policies
+# ---------------------------------------------------------------------------
+
+def list_policies(db: Session, office_id: Optional[int] = None) -> list[models.Policy]:
+    q = db.query(models.Policy)
+    if office_id is not None:
+        q = q.filter(
+            (models.Policy.office_id == office_id) | (models.Policy.office_id.is_(None))
+        )
+    return q.all()
+
+
+def create_policy(db: Session, payload: schemas.PolicyCreate) -> models.Policy:
+    if payload.office_id is not None:
+        office = db.query(models.Office).filter(models.Office.id == payload.office_id).first()
+        if office is None:
+            raise KeyError("office")
+    if payload.min_days_ahead > payload.max_days_ahead:
+        raise ValueError("Min days ahead must not exceed max days ahead.")
+    if payload.min_duration_minutes > payload.max_duration_minutes:
+        raise ValueError("Min duration must not exceed max duration.")
+    policy = models.Policy(**payload.model_dump())
+    db.add(policy)
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+def update_policy(db: Session, policy_id: int, payload: schemas.PolicyUpdate) -> models.Policy:
+    policy = db.query(models.Policy).filter(models.Policy.id == policy_id).first()
+    if policy is None:
+        raise KeyError("policy")
+    update_data = payload.model_dump(exclude_unset=True)
+    office_id = update_data.get("office_id", policy.office_id)
+    if office_id is not None:
+        office = db.query(models.Office).filter(models.Office.id == office_id).first()
+        if office is None:
+            raise KeyError("office")
+    for key, value in update_data.items():
+        setattr(policy, key, value)
+    # Validate merged values
+    min_days = update_data.get("min_days_ahead", policy.min_days_ahead)
+    max_days = update_data.get("max_days_ahead", policy.max_days_ahead)
+    min_dur = update_data.get("min_duration_minutes", policy.min_duration_minutes)
+    max_dur = update_data.get("max_duration_minutes", policy.max_duration_minutes)
+    if min_days > max_days:
+        raise ValueError("Min days ahead must not exceed max days ahead.")
+    if min_dur is not None and max_dur is not None and min_dur > max_dur:
+        raise ValueError("Min duration must not exceed max duration.")
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+def delete_policy(db: Session, policy_id: int) -> None:
+    policy = db.query(models.Policy).filter(models.Policy.id == policy_id).first()
+    if policy is None:
+        raise KeyError("policy")
+    db.delete(policy)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Users (auth)
+# ---------------------------------------------------------------------------
+
+def get_user_by_username(db: Session, username: str) -> Optional[models.User]:
+    return db.query(models.User).filter(models.User.username == username).first()
+
+
+def get_user_by_email(db: Session, email: str) -> Optional[models.User]:
+    return db.query(models.User).filter(models.User.email == email).first()
+
+
+def create_user(
+    db: Session, username: str, email: str, hashed_password: str, role: str = "user"
+) -> models.User:
+    user = models.User(
+        username=username,
+        email=email,
+        hashed_password=hashed_password,
+        role=role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
